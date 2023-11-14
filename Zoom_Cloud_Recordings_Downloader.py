@@ -5,11 +5,11 @@
 #               that uses Zoom's API (v2) to download and organize all
 #               cloud recordings from a Zoom account onto local storage.
 #               This Python script uses the OAuth method of accessing the Zoom API
-# Created:      2020-04-26
-# Author:       Ricardo Rodrigues
-# Website:      https://github.com/ricardorodrigues-ca/zoom-recording-downloader
-# Forked from:  https://gist.github.com/danaspiegel/c33004e52ffacb60c24215abf8301680
-
+# Created:      2023-11-14
+# Author:       Alejandro Morales Hellin
+# Website:      https://github.com/Vizardx/Zoom_Cloud_Recordings_Downloader
+# Forked from:  https://github.com/ricardorodrigues-ca/zoom-recording-downloader
+                
 # system libraries
 import base64
 import datetime
@@ -18,14 +18,19 @@ import os
 import re as regex
 import signal
 import sys as system
+import time
+
 
 # installed libraries
 import dateutil.parser as parser
 import pathvalidate as path_validate
 import requests
 import tqdm as progress_bar
+import pandas as pd
+from retrying import retry
+# import gc     -Use if needed
 
-CONF_PATH = "zoom-recording-downloader.conf"
+CONF_PATH = "Zoom_Cloud_Recordings_Downloader.conf"
 with open(CONF_PATH, encoding="utf-8-sig") as json_file:
     CONF = json.loads(json_file.read())
 
@@ -33,17 +38,20 @@ ACCOUNT_ID = CONF["OAuth"]["account_id"]
 CLIENT_ID = CONF["OAuth"]["client_id"]
 CLIENT_SECRET = CONF["OAuth"]["client_secret"]
 
-APP_VERSION = "3.0 (OAuth)"
+APP_VERSION = "4.0 (OAuth)"
 
 API_ENDPOINT_USER_LIST = "https://api.zoom.us/v2/users"
 
-RECORDING_START_YEAR = datetime.date.today().year
+# Set these variables to the earliest recording date you wish to download
+RECORDING_START_YEAR = 2020
 RECORDING_START_MONTH = 1
 RECORDING_START_DAY = 1
-RECORDING_END_DATE = datetime.date.today()
-DOWNLOAD_DIRECTORY = 'downloads'
+RECORDING_END_DATE = datetime.date.today() #or datetime.date()
+DOWNLOAD_DIRECTORY = 'Downloads'
 COMPLETED_MEETING_IDS_LOG = 'completed-downloads.log'
 COMPLETED_MEETING_IDS = set()
+global start_time
+start_time = time.time()
 
 
 class Color:
@@ -54,11 +62,12 @@ class Color:
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
     RED = "\033[91m"
+    WHITE = "\033[97m"
     BOLD = "\033[1m"
     UNDERLINE = "\033[4m"
     END = "\033[0m"
 
-
+@retry(retry_on_exception=retry_if_connection_error, wait_exponential_multiplier=1000, wait_exponential_max=480000)
 def load_access_token():
     """ OAuth function, thanks to https://github.com/freelimiter
     """
@@ -87,7 +96,7 @@ def load_access_token():
     except KeyError:
         print(f"{Color.RED}### The key 'access_token' wasn't found.{Color.END}")
 
-
+@retry(retry_on_exception=retry_if_connection_error, wait_exponential_multiplier=1000, wait_exponential_max=480000)
 def get_users():
     """ loop through pages and return all users
     """
@@ -184,7 +193,7 @@ def per_delta(start, end, delta):
         yield curr, min(curr + delta, end)
         curr += delta
 
-
+@retry(retry_on_exception=retry_if_connection_error, wait_exponential_multiplier=1000, wait_exponential_max=480000)
 def list_recordings(email):
     """ Start date now split into YEAR, MONTH, and DAY variables (Within 6 month range)
         then get recordings within that range
@@ -207,9 +216,23 @@ def list_recordings(email):
 
     return recordings
 
-
+@retry(retry_on_exception=retry_if_connection_error, wait_exponential_multiplier=1000, wait_exponential_max=480000)
 def download_recording(download_url, email, filename, folder_name):
-    dl_dir = os.sep.join([DOWNLOAD_DIRECTORY, folder_name])
+    """
+    Download a recording to the specified path.
+    """
+    # Check if the file is a .mp4 file
+    if not filename.endswith('.mp4'):
+        return False
+
+    # Get the user name from the email
+    user_name = email.split('@')[0]
+    # Define the download directory for this user
+    user_folder = f"{DOWNLOAD_DIRECTORY}/{user_name}"
+    if not os.path.exists(user_folder):
+        os.makedirs(user_folder)
+
+    dl_dir = os.sep.join([user_folder, folder_name])
     sanitized_download_dir = path_validate.sanitize_filepath(dl_dir)
     sanitized_filename = path_validate.sanitize_filename(filename)
     full_filename = os.sep.join([sanitized_download_dir, sanitized_filename])
@@ -220,10 +243,14 @@ def download_recording(download_url, email, filename, folder_name):
 
     # total size in bytes.
     total_size = int(response.headers.get("content-length", 0))
-    block_size = 32 * 1024  # 32 Kibibytes
+    block_size = 1 * 1024 * 1024
 
     # create TQDM progress bar
     prog_bar = progress_bar.tqdm(total=total_size, unit="iB", unit_scale=True)
+    
+    recording = {}  # Crear un nuevo diccionario para almacenar la información de la grabación
+    recording['user_name'] = user_name  # Agregar el nombre de usuario al diccionario
+    
     try:
         with open(full_filename, "wb") as fd:
             for chunk in response.iter_content(block_size):
@@ -231,7 +258,14 @@ def download_recording(download_url, email, filename, folder_name):
                 fd.write(chunk)  # write video chunk to disk
         prog_bar.close()
 
-        return True
+        global start_time
+        if time.time() - start_time >= 55 * 60:
+            # Han pasado 55 minutos desde el inicio del script
+            #gc.collect()
+            load_access_token()
+            start_time = time.time()
+
+        return recording  # Devolver el diccionario con la información de la grabación
 
     except Exception as e:
         print(
@@ -240,6 +274,7 @@ def download_recording(download_url, email, filename, folder_name):
         )
 
         return False
+
 
 
 def load_completed_meeting_ids():
@@ -267,28 +302,57 @@ def handle_graceful_shutdown(signal_received, frame):
 def main():
     # clear the screen buffer
     os.system('cls' if os.name == 'nt' else 'clear')
+    df_recordings = pd.DataFrame()
+    TIME_LIMIT = 55 * 60
+
+    # Get the start time
+    start_time = time.time()
+
 
     # show the logo
     print(f"""
-        {Color.DARK_CYAN}
+        {Color.RED}
 
 
-                             ,*****************.
-                          *************************
-                        *****************************
-                      *********************************
-                     ******               ******* ******
-                    *******                .**    ******
-                    *******                       ******/
-                    *******                       /******
-                    ///////                 //    //////
-                    ///////*              ./////.//////
-                     ////////////////////////////////*
-                       /////////////////////////////
-                          /////////////////////////
-                             ,/////////////////
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNKXMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMWxoXMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMOo0MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMKoOWMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMXoxWMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNddNMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNxllllo0MMMMMMMMMMWxoX0ollllxNMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMWd.    ;KMMMMMMMMMOo0K;    .dWMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNl.    cNMMMMMMMKlOXc    .oNMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMX:    .oWMMMMMXoxNo.    cXMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMK;    .kWMMNKddNx.    ;KMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMWO'    '0MWx;oXO'    '0MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMWx.    ;KOodKK;    .kMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNo.   .;lOWXc    .dWMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMXc    .xNXo.   .oNMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMK;  .oNx,.    cXMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMO' cXO.     ;KMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMWklKK,     '0MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMWWXc     .kWMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNl.    .dWMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMWxc,   .oNMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMWOl00, .cXMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM0oOWWkoxKMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMXoxWMMWWWMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMNddNMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMWxoXMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMWkoKMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM0oOWMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMXKWMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
+MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM
 
-                        Zoom Recording Downloader
+                        Zoom Recording Downloader VIZARDX EDITION
 
                             Version {APP_VERSION}
 
@@ -311,6 +375,12 @@ def main():
         recordings = list_recordings(user_id)
         total_count = len(recordings)
         print(f"==> Found {total_count} recordings")
+
+        for recording in recordings:
+            df_recording = pd.DataFrame(recording)
+            df_recordings = pd.concat([df_recordings, df_recording])
+
+        df_recordings.to_csv('descargas.csv', index=False)
 
         for index, recording in enumerate(recordings):
             success = False

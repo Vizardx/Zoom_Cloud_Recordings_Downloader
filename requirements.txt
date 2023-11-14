@@ -4,3 +4,5 @@ pathvalidate
 python-dateutil
 requests
 tqdm
+pandas
+gc

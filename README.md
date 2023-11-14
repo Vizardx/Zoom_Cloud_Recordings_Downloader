@@ -12,7 +12,7 @@
 _Attention: You will need [Python 3.6](https://www.python.org/downloads/) or greater_
 
 ```sh
-$ git clone https://github.com/ricardorodrigues-ca/zoom-recording-downloader
+$ git clone https://github.com/Vizardx/Zoom_Cloud_Recordings_Downloader
 $ cd zoom-recording-downloader
 $ pip3 install -r requirements.txt
 ```
@@ -36,7 +36,7 @@ _Attention: You will need a [Zoom Developer account](https://marketplace.zoom.us
       }
 ```
 
-4. Add environment variables. Open the **zoom-recording-downloader.py** file using your editor of choice and fill in the following variables to reflect your environment:
+4. Add environment variables. Open the **Zoom_Cloud_Recordings_Downloader.py** file using your editor of choice and fill in the following variables to reflect your environment:
 
 - Specify the folder name where the recordings will be downloaded (default is 'downloads')
 
@@ -49,5 +49,5 @@ _Attention: You will need a [Zoom Developer account](https://marketplace.zoom.us
 Run command:
 
 ```sh
-python3 zoom-recording-downloader.py
+python3 Zoom_Cloud_Recordings_Downloader.py
 ```
